@@ -8,6 +8,8 @@ from enum import Enum
 from threading import Thread
 from typing import Dict, Iterable, Optional, Tuple, Union
 
+from httpx import Response
+
 from .credentials import CertificateCredentials, Credentials
 from .errors import ConnectionFailed, exception_class_for_reason
 # We don't generally need to know about the Credentials subclasses except to
@@ -48,15 +50,14 @@ class APNsClient(object):
 
     def __init__(self,
                  credentials: Union[Credentials, str],
-                 use_sandbox: bool = False, use_alternative_port: bool = False, proto: Optional[str] = None,
+                 use_sandbox: bool = False, use_alternative_port: bool = False,
                  json_encoder: Optional[type] = None, password: Optional[str] = None,
-                 proxy_host: Optional[str] = None, proxy_port: Optional[int] = None,
                  heartbeat_period: Optional[float] = None) -> None:
         if isinstance(credentials, str):
             self.__credentials = CertificateCredentials(credentials, password)  # type: Credentials
         else:
             self.__credentials = credentials
-        self._init_connection(use_sandbox, use_alternative_port, proto, proxy_host, proxy_port)
+        self._init_connection(use_sandbox, use_alternative_port)
 
         if heartbeat_period:
             self._start_heartbeat(heartbeat_period)
@@ -65,11 +66,10 @@ class APNsClient(object):
         self.__max_concurrent_streams = 0
         self.__previous_server_max_concurrent_streams = None
 
-    def _init_connection(self, use_sandbox: bool, use_alternative_port: bool, proto: Optional[str],
-                         proxy_host: Optional[str], proxy_port: Optional[int]) -> None:
+    def _init_connection(self, use_sandbox: bool, use_alternative_port: bool) -> None:
         server = self.SANDBOX_SERVER if use_sandbox else self.LIVE_SERVER
         port = self.ALTERNATIVE_PORT if use_alternative_port else self.DEFAULT_PORT
-        self._connection = self.__credentials.create_connection(server, port, proto, proxy_host, proxy_port)
+        self._connection = self.__credentials.create_connection(server, port)
 
     def _start_heartbeat(self, heartbeat_period: float) -> None:
         conn_ref = weakref.ref(self._connection)
@@ -102,7 +102,7 @@ class APNsClient(object):
     def send_notification_async(self, token_hex: str, notification: Payload, topic: Optional[str] = None,
                                 priority: NotificationPriority = NotificationPriority.Immediate,
                                 expiration: Optional[int] = None, collapse_id: Optional[str] = None,
-                                push_type: Optional[NotificationType] = None) -> int:
+                                push_type: Optional[NotificationType] = None) -> Response:
         json_str = json.dumps(notification.dict(), cls=self.__json_encoder, ensure_ascii=False, separators=(',', ':'))
         json_payload = json_str.encode('utf-8')
 
@@ -145,25 +145,24 @@ class APNsClient(object):
         if collapse_id is not None:
             headers['apns-collapse-id'] = collapse_id
 
-        url = '/3/device/{}'.format(token_hex)
-        stream_id = self._connection.request('POST', url, json_payload, headers)  # type: int
-        return stream_id
+        url = f"/3/device/{token_hex}"
+        response = self._connection.post(url, headers=headers, json=json_payload)
+        # Handle the response accordingly
+        return response
 
-    def get_notification_result(self, stream_id: int) -> Union[str, Tuple[str, str]]:
+    def get_notification_result(self, response: Response) -> Union[str, Tuple[str, str]]:
         """
         Get result for specified stream
         The function returns: 'Success' or 'failure reason' or ('Unregistered', timestamp)
         """
-        with self._connection.get_response(stream_id) as response:
-            if response.status == 200:
-                return 'Success'
+        data = response.json()
+        if response.status_code == 200:
+            return 'Success'
+        else:
+            if response.status_code == 410:
+                return data['reason'], data['timestamp']
             else:
-                raw_data = response.read().decode('utf-8')
-                data = json.loads(raw_data)  # type: Dict[str, str]
-                if response.status == 410:
-                    return data['reason'], data['timestamp']
-                else:
-                    return data['reason']
+                return data['reason']
 
     def send_notification_batch(self, notifications: Iterable[Notification], topic: Optional[str] = None,
                                 priority: NotificationPriority = NotificationPriority.Immediate,
